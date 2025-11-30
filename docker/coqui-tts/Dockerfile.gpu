@@ -1,0 +1,125 @@
+# =============================================================================
+# Coqui TTS GPU Dockerfile for ARM64 GB10 (Grace Blackwell)
+# Strategy 2: coqui-tts 0.25.3 (numpy<2 compatible) with NGC PyTorch
+# =============================================================================
+
+FROM nvcr.io/nvidia/pytorch:25.04-py3
+
+LABEL maintainer="local-ai-packaged"
+LABEL description="Coqui TTS 0.25.3 with GPU support for NVIDIA GB10 (ARM64)"
+
+# Environment
+ENV TTS_HOME=/root/.local/share/tts
+ENV NVIDIA_VISIBLE_DEVICES=all
+ENV NVIDIA_DRIVER_CAPABILITIES=compute,utility
+ENV DEBIAN_FRONTEND=noninteractive
+
+# =============================================================================
+# Stage 1: System dependencies
+# =============================================================================
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # TTS runtime
+    espeak-ng \
+    libsndfile1 \
+    ffmpeg \
+    # torchaudio build dependencies
+    git \
+    cmake \
+    pkg-config \
+    libavformat-dev \
+    libavcodec-dev \
+    libavutil-dev \
+    libavdevice-dev \
+    libavfilter-dev \
+    libswscale-dev \
+    libswresample-dev \
+    sox \
+    libsox-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# =============================================================================
+# Stage 2: Build torchaudio from source (ARM64 binary not available on PyPI)
+# Note: Use pip install with --no-deps to avoid dependency check on NGC torch
+# =============================================================================
+RUN cd /tmp && \
+    git clone --depth 1 --branch v2.7.0 https://github.com/pytorch/audio.git torchaudio && \
+    cd torchaudio && \
+    python setup.py bdist_wheel && \
+    pip install --no-deps dist/*.whl && \
+    cd / && rm -rf /tmp/torchaudio
+
+# =============================================================================
+# Stage 3: Install Coqui TTS 0.25.3 (numpy<2 compatible)
+# Key: Use --no-deps for packages that would pull PyPI torch
+# =============================================================================
+
+# Disable NGC pip constraints to allow package installation
+ENV PIP_CONSTRAINT=""
+RUN rm -f /etc/pip/constraint.txt || true
+
+# Core TTS packages (--no-deps to preserve NGC torch)
+RUN pip install --no-cache-dir --no-deps \
+    'coqui-tts==0.25.3' \
+    'coqui-tts-trainer>=0.2.0,<0.3.0'
+
+# Transformers ecosystem (compatible versions, --no-deps)
+RUN pip install --no-cache-dir --no-deps \
+    'transformers==4.43.0' \
+    'huggingface-hub<1.0'
+
+RUN pip install --no-cache-dir 'tokenizers>=0.19,<0.20'
+
+# Config packages
+RUN pip install --no-cache-dir --no-deps 'coqpit-config>=0.1.1,<0.2.0'
+
+# gruut (--no-deps to avoid torch replacement)
+RUN pip install --no-cache-dir --no-deps \
+    gruut \
+    gruut-ipa \
+    'gruut_lang_de>=2.0' \
+    'gruut_lang_en>=2.0' \
+    'gruut_lang_es>=2.0' \
+    'gruut_lang_fr>=2.0'
+
+# encodec (--no-deps, it depends on torch)
+RUN pip install --no-cache-dir --no-deps encodec
+
+# Other dependencies (safe packages without torch dependency)
+RUN pip install --no-cache-dir \
+    anyascii \
+    einops \
+    inflect \
+    matplotlib \
+    monotonic-alignment-search \
+    num2words \
+    pysbd \
+    pyyaml \
+    soundfile \
+    tqdm \
+    typing-extensions \
+    python-crfsuite \
+    jsonlines \
+    docopt \
+    regex \
+    dateparser \
+    pytz \
+    tzlocal \
+    python-dateutil
+
+# spacy without Japanese (avoid Rust build for sudachipy)
+RUN pip install --no-cache-dir 'spacy>=3,<3.8'
+
+# Flask for tts-server
+RUN pip install --no-cache-dir flask
+
+# =============================================================================
+# Stage 4: Setup
+# =============================================================================
+RUN mkdir -p ${TTS_HOME}
+
+EXPOSE 5002
+WORKDIR /app
+
+# Default: XTTS v2 model with CUDA
+ENTRYPOINT ["tts-server"]
+CMD ["--model_name", "tts_models/multilingual/multi-dataset/xtts_v2", "--use_cuda", "true"]

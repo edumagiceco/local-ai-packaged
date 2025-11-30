@@ -1,6 +1,9 @@
 include:
   - ./supabase/docker/docker-compose.yml
 
+networks:
+  tts_network:
+
 volumes:
   n8n_storage:
   ollama_storage:
@@ -14,12 +17,16 @@ volumes:
   langfuse_clickhouse_data:
   langfuse_clickhouse_logs:
   langfuse_minio_data:
+  whisper_cache: #[magic] add
 
 x-n8n: &service-n8n
-  image: n8nio/n8n:latest
+  build:
+    context: ./docker/n8n
+    dockerfile: Dockerfile
+  image: edumagiceco-n8n:latest
   environment:
     - DB_TYPE=postgresdb
-    - DB_POSTGRESDB_HOST=db
+    - DB_POSTGRESDB_HOST=postgres
     - DB_POSTGRESDB_USER=postgres
     - DB_POSTGRESDB_PASSWORD=${POSTGRES_PASSWORD}
     - DB_POSTGRESDB_DATABASE=postgres
@@ -27,6 +34,7 @@ x-n8n: &service-n8n
     - N8N_PERSONALIZATION_ENABLED=false
     - N8N_ENCRYPTION_KEY
     - N8N_USER_MANAGEMENT_JWT_SECRET
+    - N8N_SECURE_COOKIE=false
     - WEBHOOK_URL=${N8N_HOSTNAME:+https://}${N8N_HOSTNAME:-http://localhost:5678}
 
 x-ollama: &service-ollama
@@ -51,7 +59,7 @@ x-init-ollama: &init-ollama
   entrypoint: /bin/sh
   command:
     - "-c"
-    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull qwen2.5:7b-instruct-q4_K_M; OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text"
+    - "sleep 3; OLLAMA_HOST=ollama:11434 ollama pull qwen3:8b-q4_K_M; OLLAMA_HOST=ollama:11434 ollama pull nomic-embed-text"
 
 services:
   flowise:
@@ -90,17 +98,25 @@ services:
       - "n8n import:credentials --separate --input=/backup/credentials && n8n import:workflow --separate --input=/backup/workflows"
     volumes:
       - ./n8n/backup:/backup
+    # [추가] postgres DB에 연결할 수 있도록 네트워크를 지정합니다.
+    networks:
+      - tts_network  
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   n8n:
     <<: *service-n8n
     container_name: n8n
     restart: unless-stopped
-    expose:
-      - 5678/tcp
+    ports:
+      - "5678:5678"
     volumes:
       - n8n_storage:/home/node/.n8n
       - ./n8n/backup:/backup
       - ./shared:/data/shared
+    networks:
+      - tts_network
     depends_on:
       n8n-import:
         condition: service_completed_successfully
@@ -304,6 +320,9 @@ services:
       POSTGRES_DB: postgres
     volumes:
       - langfuse_postgres_data:/var/lib/postgresql/data
+    # [추가] n8n, coqui-tts와 동일한 네트워크에 연결
+    networks:
+      - tts_network      
 
   redis:
     container_name: redis
@@ -349,6 +368,8 @@ services:
       - CHOWN
       - SETGID
       - SETUID
+    networks:
+      - tts_network
     logging:
       driver: "json-file"
       options:
@@ -358,10 +379,14 @@ services:
   ollama-cpu:
     profiles: ["cpu"]
     <<: *service-ollama
+    networks:
+      - tts_network
 
   ollama-gpu:
     profiles: ["gpu-nvidia"]
     <<: *service-ollama
+    networks:
+      - tts_network    
     deploy:
       resources:
         reservations:
@@ -374,6 +399,8 @@ services:
     profiles: ["gpu-amd"]
     <<: *service-ollama
     image: ollama/ollama:rocm
+    networks:
+      - tts_network
     devices:
       - "/dev/kfd"
       - "/dev/dri"
@@ -383,12 +410,16 @@ services:
     <<: *init-ollama
     depends_on:
       - ollama-cpu
+    networks:
+      - tts_network
 
   ollama-pull-llama-gpu:
     profiles: ["gpu-nvidia"]
     <<: *init-ollama
     depends_on:
       - ollama-gpu
+    networks:
+      - tts_network
 
   ollama-pull-llama-gpu-amd:
     profiles: [gpu-amd]
@@ -396,3 +427,129 @@ services:
     image: ollama/ollama:rocm
     depends_on:
      - ollama-gpu-amd
+    networks:
+     - tts_network
+
+  insightslm:
+    build:
+      context: ./insights-lm-local-package
+      dockerfile: Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${API_EXTERNAL_URL}
+        VITE_SUPABASE_ANON_KEY: ${ANON_KEY}
+    container_name: insightslm
+    ports:
+      - 3010:80
+    restart: unless-stopped
+    networks:
+      - tts_network
+
+  coqui-tts-cpu:
+    image: coqui-tts:cpu
+    container_name: coqui-tts
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    entrypoint: tts-server
+    command: ["--model_name", "tts_models/multilingual/multi-dataset/xtts_v2", "--use_cuda", "false"]
+    networks:
+      - tts_network
+    profiles:
+      - "cpu"
+
+  coqui-tts-gpu:
+    image: coqui-tts:latest
+    container_name: coqui-tts
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    entrypoint: tts-server
+    command: ["--model_name", "tts_models/multilingual/multi-dataset/xtts_v2", "--use_cuda", "true"]
+    networks:
+      - tts_network
+    profiles:
+      - "gpu-nvidia"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  coqui-tts-gpu-amd:
+    image: coqui-tts:latest
+    container_name: coqui-tts
+    restart: unless-stopped
+    ports:
+      - "5002:5002"
+    entrypoint: tts-server
+    command: ["--model_name", "tts_models/multilingual/multi-dataset/xtts_v2", "--use_cuda", "true"]
+    networks:
+      - tts_network
+    profiles:
+      - "gpu-amd"
+    devices:
+      - "/dev/kfd"
+      - "/dev/dri"
+
+  whisper-asr-cpu:
+    image: onerahmet/openai-whisper-asr-webservice:v1.9.1
+    container_name: whisper-asr
+    restart: unless-stopped
+    ports:
+      - "9002:9000"
+    environment:
+      - ASR_MODEL=${WHISPER_MODEL:-large-v3}  # Options: tiny, base, small, medium, large, large-v3
+      - ASR_ENGINE=${WHISPER_ENGINE:-faster_whisper}  # Options: openai_whisper, faster_whisper
+      - ASR_MODEL_PATH=/data/whisper
+    volumes:
+      - whisper_cache:/data/whisper  # Persist model cache to avoid redownloading
+    networks:
+      - tts_network
+    profiles:
+      - "cpu"
+
+  whisper-asr-gpu:
+    image: whisper-asr:latest
+    container_name: whisper-asr
+    restart: unless-stopped
+    ports:
+      - "9002:9000"
+    environment:
+      - ASR_MODEL=${WHISPER_MODEL:-large-v3}  # Options: tiny, base, small, medium, large, large-v3
+      - ASR_ENGINE=${WHISPER_ENGINE:-faster_whisper}  # Options: openai_whisper, faster_whisper
+      - ASR_MODEL_PATH=/data/whisper
+    volumes:
+      - whisper_cache:/data/whisper  # Persist model cache to avoid redownloading
+    networks:
+      - tts_network
+    profiles:
+      - "gpu-nvidia"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  whisper-asr-gpu-amd:
+    image: whisper-asr:latest
+    container_name: whisper-asr
+    restart: unless-stopped
+    ports:
+      - "9002:9000"
+    environment:
+      - ASR_MODEL=${WHISPER_MODEL:-large-v3}  # Options: tiny, base, small, medium, large, large-v3
+      - ASR_ENGINE=${WHISPER_ENGINE:-faster_whisper}  # Options: openai_whisper, faster_whisper
+      - ASR_MODEL_PATH=/data/whisper
+    volumes:
+      - whisper_cache:/data/whisper  # Persist model cache to avoid redownloading
+    networks:
+      - tts_network
+    profiles:
+      - "gpu-amd"
+    devices:
+      - "/dev/kfd"
+      - "/dev/dri"

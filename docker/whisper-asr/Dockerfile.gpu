@@ -1,0 +1,44 @@
+# Whisper ASR GPU Dockerfile using NVIDIA NGC PyTorch
+# Multi-architecture support: AMD64 and ARM64
+# CUDA 12.6.3, PyTorch 2.6.0, Python 3.12
+
+FROM nvcr.io/nvidia/pytorch:24.12-py3
+
+LABEL maintainer="local-ai-packaged"
+LABEL description="OpenAI Whisper ASR with GPU support (NVIDIA NGC PyTorch, CUDA 12.6)"
+
+# Set environment variables
+ENV DEBIAN_FRONTEND=noninteractive
+ENV ASR_MODEL=base
+ENV ASR_ENGINE=openai_whisper
+ENV ASR_MODEL_PATH=/data/whisper
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsndfile1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Whisper and API dependencies
+RUN pip install --no-cache-dir \
+    openai-whisper \
+    faster-whisper \
+    uvicorn \
+    fastapi \
+    python-multipart \
+    aiofiles
+
+# Create model cache directory
+RUN mkdir -p ${ASR_MODEL_PATH}
+
+# Expose port for ASR server
+EXPOSE 9000
+
+# Set working directory
+WORKDIR /app
+
+# Copy the server script
+COPY server.py /app/server.py
+
+# Default command
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "9000"]
